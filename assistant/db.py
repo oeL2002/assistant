@@ -87,12 +87,32 @@ CREATE TABLE IF NOT EXISTS sent_invites (
 """
 
 
+# Columns added to a table after its first release. `CREATE TABLE IF NOT EXISTS`
+# leaves a pre-existing table untouched, so a database created by an older
+# version is missing them — patch them in on connect. Idempotent: each is added
+# only if absent, so fresh databases (which already have them) are unaffected.
+# ADD COLUMN with NOT NULL needs a DEFAULT, which these have.
+_ADDED_COLUMNS = [
+    ("sent_invites", "show_as", "TEXT NOT NULL DEFAULT 'busy'"),
+    ("sent_invites", "rrule", "TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    conn.commit()
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
