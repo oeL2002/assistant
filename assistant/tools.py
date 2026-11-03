@@ -19,7 +19,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from . import db as _db
 from . import files as _files
 from . import mail as _mail
-from .calendar import TZ, Calendar, parse_local
+from .calendar import TZ, Calendar, overlaps, parse_local
 from .config import Config
 
 _conn: sqlite3.Connection | None = None
@@ -75,23 +75,33 @@ def _text(s: str) -> dict:
 
 @tool(
     "upcoming_events",
-    "List the user's work-calendar events for the next N days.",
+    "List the user's work-calendar events in a window. Defaults to the next N days "
+    "from today; pass `start` to inspect any period (e.g. to check conflicts months "
+    "ahead).",
     {
         "type": "object",
         "properties": {
             "days": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 60,
-                "description": "How many days ahead to include (default 7).",
-            }
+                "maximum": 366,
+                "description": "Window length in days from `start` (default 7).",
+            },
+            "start": {
+                "type": "string",
+                "description": "ISO date/datetime to start the window at (default: today), e.g. 2027-02-01.",
+            },
         },
         "required": [],
     },
 )
 async def upcoming_events(args: dict[str, Any]) -> dict:
     assert _calendar is not None
-    events = await _calendar.upcoming(int(args.get("days", 7)))
+    try:
+        start = parse_local(args["start"]) if args.get("start") else dt.datetime.now(TZ)
+    except ValueError:
+        return _text("Couldn't read that start date — use ISO like 2027-02-01.")
+    events = await _calendar.between(start, start + dt.timedelta(days=int(args.get("days", 7))))
     if not events:
         return _text("No calendar events in that window (or the calendar isn't configured).")
     lines = [
@@ -224,17 +234,27 @@ async def schedule_block(args: dict[str, Any]) -> dict:
 
 @tool(
     "list_plan",
-    "List the time blocks on Leo's plan calendar for the next N days (default 7).",
+    "List the time blocks on Leo's plan calendar in a window. Defaults to the next "
+    "N days from today; pass `start` to inspect any period.",
     {
         "type": "object",
-        "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 60}},
+        "properties": {
+            "days": {"type": "integer", "minimum": 1, "maximum": 366},
+            "start": {
+                "type": "string",
+                "description": "ISO date/datetime to start the window at (default: today), e.g. 2027-02-01.",
+            },
+        },
         "required": [],
     },
 )
 async def list_plan(args: dict[str, Any]) -> dict:
-    now = dt.datetime.now(TZ)
-    until = now + dt.timedelta(days=int(args.get("days", 7)))
-    rows = [r for r in _db.list_events(_conn) if now <= parse_local(r["end_at"]) and parse_local(r["start_at"]) <= until]
+    try:
+        start = parse_local(args["start"]) if args.get("start") else dt.datetime.now(TZ)
+    except ValueError:
+        return _text("Couldn't read that start date — use ISO like 2027-02-01.")
+    end = start + dt.timedelta(days=int(args.get("days", 7)))
+    rows = [r for r in _db.list_events(_conn) if overlaps(r["start_at"], r["end_at"], start, end)]
     if not rows:
         return _text("No planned blocks in that window.")
     lines = [

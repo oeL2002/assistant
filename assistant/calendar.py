@@ -31,6 +31,11 @@ def parse_local(s: str) -> dt.datetime:
     return parsed.replace(tzinfo=TZ) if parsed.tzinfo is None else parsed.astimezone(TZ)
 
 
+def overlaps(start_at: str, end_at: str, start: dt.datetime, end: dt.datetime) -> bool:
+    """True if a stored event [start_at, end_at] (ISO) intersects the window [start, end]."""
+    return parse_local(start_at) <= end and parse_local(end_at) >= start
+
+
 def _as_dt(x: object) -> dt.datetime:
     """Normalise an icalendar DTSTART/DTEND (date or datetime) to a TZ-aware dt."""
     if isinstance(x, dt.datetime):
@@ -71,9 +76,12 @@ class Calendar:
         self._cache = (now, resp.content)
         return resp.content
 
-    async def upcoming(self, days: int) -> list[Event]:
+    async def between(self, start: dt.datetime, end: dt.datetime) -> list[Event]:
         raw = await self._raw()
         if raw is None:
             return []
+        return expand(raw, start, end)
+
+    async def upcoming(self, days: int) -> list[Event]:
         start = dt.datetime.now(TZ)
-        return expand(raw, start, start + dt.timedelta(days=days))
+        return await self.between(start, start + dt.timedelta(days=days))
