@@ -90,7 +90,7 @@ def test_cancel_one_occurrence_of_a_recurring_invite(tmp_path, monkeypatch):
                     "busy", "FREQ=WEEKLY;BYDAY=MO,WE")
     out = asyncio.run(tools.cancel_work_invite.handler({"id": 1, "occurrence": "2026-11-25"}))
     assert "on Wed 25 Nov only" in out["content"][0]["text"]
-    (_, start, kw), = sent
+    (_, _, kw), = sent
     assert kw["method"] == "CANCEL" and kw["uid"] == "u@x" and kw["sequence"] == 1
     assert kw["recurrence_id"].isoformat() == "2026-11-25T08:00:00+01:00"
     listing = asyncio.run(tools.list_work_invites.handler({}))["content"][0]["text"]

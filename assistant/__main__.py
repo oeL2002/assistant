@@ -15,13 +15,14 @@ import sys
 
 import httpx
 
-from . import files, publish, tools
+from . import files, gym, publish, tools
 from .brain import TZ, reply
-from .calendar import Calendar
+from .calendar import Calendar, expand
 from .config import Config
 from .db import (
     connect,
     get_meta,
+    get_plan,
     leo_wrote_since,
     log_message,
     mark_reminder_done,
@@ -53,6 +54,7 @@ _HEARTBEAT_KEY = "heartbeat"
 _OUTAGE = dt.timedelta(minutes=10)  # a gap in heartbeats longer than this was an outage
 _STALE = dt.timedelta(hours=2)  # a reminder this late gets flagged as possibly moot
 _SETTLE_S = 1.5  # wait this long for the rest of a message Telegram split up
+_GYM_LEAD = dt.timedelta(hours=2)  # plan the workout this long before a gym block
 
 
 def _local(utc_iso: str) -> dt.datetime:
@@ -90,6 +92,34 @@ async def _fire_due_reminders(tg: Telegram, conn: sqlite3.Connection) -> None:
             answer = f"(reminder error: {type(exc).__name__})"
         log_message(conn, r["chat_id"], "assistant", answer)
         await tg.send_message(r["chat_id"], answer)
+
+
+async def _prepare_gym(tg: Telegram, conn: sqlite3.Connection, cfg: Config) -> None:
+    """About _GYM_LEAD before a gym block on the plan, have the brain plan the
+    workout and send it. Once per occurrence; skipped if a plan already exists."""
+    if cfg.allowed_chat_id is None:
+        return
+    now = dt.datetime.now(TZ)
+    for e in expand(publish.plan_ics(conn), now, now + _GYM_LEAD):
+        if e.start <= now or not gym.is_gym(e.summary):
+            continue
+        key = f"gym_prepared:{e.start.isoformat()}"
+        if get_meta(conn, key):
+            continue
+        set_meta(conn, key, "1")
+        if get_plan(conn, e.start.date().isoformat()):
+            continue  # already planned (e.g. he asked earlier)
+        prompt = (
+            f"[gym session on the plan at {e.start:%H:%M} ({e.summary})] Plan this workout: "
+            "check gym_history and how he's doing, call plan_workout for today, then send "
+            "the plan in a few lines (exercise: sets×reps @ weight)."
+        )
+        try:
+            answer = await reply(prompt, conn)
+        except Exception as exc:  # keep the daemon alive on any brain error
+            answer = f"(gym plan error: {type(exc).__name__})"
+        log_message(conn, cfg.allowed_chat_id, "assistant", answer)
+        await tg.send_message(cfg.allowed_chat_id, answer)
 
 
 async def _report_outage(tg: Telegram, conn: sqlite3.Connection, cfg: Config) -> None:
@@ -180,6 +210,7 @@ async def run() -> None:
                 await asyncio.sleep(5)
                 continue
             await _fire_due_reminders(tg, conn)  # due within ~1 poll (≤60s)
+            await _prepare_gym(tg, conn, cfg)
             mine = [
                 u["message"]
                 for u in updates

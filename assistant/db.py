@@ -108,6 +108,45 @@ CREATE TABLE IF NOT EXISTS topic_triggers (
     done    INTEGER NOT NULL DEFAULT 0
 );
 
+-- Gym. The exercise list the assistant maintains. One row per movement: a
+-- different angle, grip or piece of equipment is a different exercise, with its
+-- own history and progression. The rep range is the coach's decision, so it
+-- starts empty; once set, progression is double progression (work up to
+-- rep_high on every set, then add increment_kg and start again at rep_low).
+CREATE TABLE IF NOT EXISTS exercises (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    notes        TEXT,                   -- setup and cues only, never the variant
+    increment_kg REAL,                   -- NULL until the coach sets it
+    rep_low      INTEGER,
+    rep_high     INTEGER,
+    active       INTEGER NOT NULL DEFAULT 1
+);
+
+-- One row per set, logged from the gym page. client_id is made by the page so
+-- a set retried after lost signal is stored once.
+CREATE TABLE IF NOT EXISTS workout_sets (
+    id          INTEGER PRIMARY KEY,
+    client_id   TEXT UNIQUE,
+    created     TEXT NOT NULL DEFAULT (datetime('now')),
+    date        TEXT NOT NULL,           -- local YYYY-MM-DD of the session
+    exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+    weight_kg   REAL NOT NULL,           -- added weight; 0 = bodyweight only
+    reps        INTEGER NOT NULL
+);
+
+-- The assistant's plan for one session, shown prefilled on the gym page.
+CREATE TABLE IF NOT EXISTS workout_plan (
+    id          INTEGER PRIMARY KEY,
+    date        TEXT NOT NULL,           -- local YYYY-MM-DD
+    sort        INTEGER NOT NULL,
+    exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+    sets        INTEGER NOT NULL,
+    reps        INTEGER NOT NULL,
+    weight_kg   REAL NOT NULL,
+    note        TEXT
+);
+
 -- What Leo actually did (sleep, study, gym, ...), for plan-vs-actual and stats.
 CREATE TABLE IF NOT EXISTS activity_log (
     id       INTEGER PRIMARY KEY,
@@ -480,3 +519,102 @@ def delete_activity(conn: sqlite3.Connection, aid: int) -> bool:
     cur = conn.execute("DELETE FROM activity_log WHERE id = ?", (aid,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# --- gym ---------------------------------------------------------------------
+
+_EXERCISE_FIELDS = {"name", "notes", "increment_kg", "rep_low", "rep_high", "active"}
+
+
+def get_exercise(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM exercises WHERE name = ?", (name.strip(),)).fetchone()
+
+
+def save_exercise(conn: sqlite3.Connection, name: str, fields: dict) -> int:
+    """Add an exercise, or update the one with this name (case-insensitive)."""
+    fields = {k: v for k, v in fields.items() if k in _EXERCISE_FIELDS and v is not None}
+    row = get_exercise(conn, name)
+    if row is None:
+        fields.setdefault("name", name.strip())
+        cur = conn.execute(
+            f"INSERT INTO exercises ({', '.join(fields)}) VALUES ({', '.join('?' * len(fields))})",
+            tuple(fields.values()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    if fields:
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE exercises SET {assignments} WHERE id = ?", (*fields.values(), row["id"]))
+        conn.commit()
+    return row["id"]
+
+
+def list_exercises(conn: sqlite3.Connection, active_only: bool = False) -> list[sqlite3.Row]:
+    where = "WHERE active = 1" if active_only else ""
+    return conn.execute(f"SELECT * FROM exercises {where} ORDER BY name").fetchall()
+
+
+def add_set(
+    conn: sqlite3.Connection, client_id: str, date: str, exercise_id: int, weight_kg: float, reps: int
+) -> sqlite3.Row:
+    """Store a set once per client_id (a retry returns the stored row)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO workout_sets (client_id, date, exercise_id, weight_kg, reps) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (client_id, date, exercise_id, weight_kg, reps),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM workout_sets WHERE client_id = ?", (client_id,)).fetchone()
+
+
+def delete_set(conn: sqlite3.Connection, set_id: int) -> bool:
+    cur = conn.execute("DELETE FROM workout_sets WHERE id = ?", (set_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def sets_on(conn: sqlite3.Connection, date: str) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM workout_sets WHERE date = ? ORDER BY id", (date,)).fetchall()
+
+
+def sessions(
+    conn: sqlite3.Connection, exercise_id: int, before: str | None = None, limit: int = 5
+) -> list[tuple[str, list[tuple[float, int]]]]:
+    """The last `limit` session dates for an exercise (before `before`, if
+    given), newest first, each with its sets in logged order."""
+    q = "SELECT DISTINCT date FROM workout_sets WHERE exercise_id = ?"
+    args: list = [exercise_id]
+    if before:
+        q += " AND date < ?"
+        args.append(before)
+    dates = [r[0] for r in conn.execute(q + " ORDER BY date DESC LIMIT ?", (*args, limit))]
+    out = []
+    for d in dates:
+        rows = conn.execute(
+            "SELECT weight_kg, reps FROM workout_sets WHERE exercise_id = ? AND date = ? ORDER BY id",
+            (exercise_id, d),
+        )
+        out.append((d, [(r["weight_kg"], r["reps"]) for r in rows]))
+    return out
+
+
+def set_plan(conn: sqlite3.Connection, date: str, items: list[dict]) -> None:
+    """Replace the plan for `date`. items: exercise_id, sets, reps, weight_kg, note."""
+    conn.execute("DELETE FROM workout_plan WHERE date = ?", (date,))
+    conn.executemany(
+        "INSERT INTO workout_plan (date, sort, exercise_id, sets, reps, weight_kg, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (date, i, it["exercise_id"], it["sets"], it["reps"], it["weight_kg"], it.get("note"))
+            for i, it in enumerate(items)
+        ],
+    )
+    conn.commit()
+
+
+def get_plan(conn: sqlite3.Connection, date: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT p.*, e.name FROM workout_plan p JOIN exercises e ON e.id = p.exercise_id "
+        "WHERE p.date = ? ORDER BY p.sort",
+        (date,),
+    ).fetchall()

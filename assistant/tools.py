@@ -20,6 +20,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from . import activity as _activity
 from . import db as _db
 from . import files as _files
+from . import gym as _gym
 from . import mail as _mail
 from . import publish as _publish
 from .calendar import TZ, Calendar, expand, parse_local
@@ -68,6 +69,10 @@ def init(conn: sqlite3.Connection, calendar: Calendar, cfg: Config | None = None
             list_activity,
             delete_activity,
             activity_stats,
+            list_exercises,
+            save_exercise,
+            gym_history,
+            plan_workout,
             save_memory,
             forget_memory,
         ],
@@ -962,6 +967,128 @@ async def activity_stats(args: dict[str, Any]) -> dict:
     except ValueError:
         return _text("Couldn't read that start date — use ISO like 2026-11-01.")
     return _text(_activity.stats(_db.list_activity(_conn), start, end))
+
+
+# --- gym ---------------------------------------------------------------------
+
+
+@tool(
+    "list_exercises",
+    "List Leo's gym exercises with their rep range, weight step and notes.",
+    {"type": "object", "properties": {}, "required": []},
+)
+async def list_exercises(args: dict[str, Any]) -> dict:
+    rows = _db.list_exercises(_conn)
+    if not rows:
+        return _text("No exercises yet.")
+    return _text("\n".join(
+        f"{r['name']} ({_gym._range(r)})"
+        + ("" if r["active"] else " [inactive]")
+        + (f" — {r['notes']}" if r["notes"] else "")
+        for r in rows
+    ))
+
+
+@tool(
+    "save_exercise",
+    "Add an exercise to Leo's list, or change one (matched by name). One exercise "
+    "per movement: a different angle, grip, body position or equipment (flat vs "
+    "incline, wide vs close grip, dumbbell vs cable) is a SEPARATE exercise with its "
+    "own name, never a note. Notes are for setup and cues only (seat height, "
+    "attachment). The rep range and weight step are yours to choose for his goal; "
+    "`active: false` retires it without losing history; `new_name` renames it.",
+    {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "new_name": {"type": "string"},
+            "notes": {"type": "string", "description": "Setup and cues, e.g. 'seat at 4'."},
+            "increment_kg": {"type": "number"},
+            "rep_low": {"type": "integer", "minimum": 1},
+            "rep_high": {"type": "integer", "minimum": 1},
+            "active": {"type": "boolean"},
+        },
+        "required": ["name"],
+    },
+)
+async def save_exercise(args: dict[str, Any]) -> dict:
+    fields = {k: args.get(k) for k in ("notes", "increment_kg", "rep_low", "rep_high")}
+    if "active" in args:
+        fields["active"] = int(bool(args["active"]))
+    if args.get("new_name"):
+        fields["name"] = args["new_name"].strip()
+    lo = fields.get("rep_low")
+    hi = fields.get("rep_high")
+    if lo is not None and hi is not None and lo > hi:
+        return _text("rep_low must not be above rep_high.")
+    try:
+        _db.save_exercise(_conn, args["name"], fields)
+    except sqlite3.IntegrityError:
+        return _text(f"There is already an exercise called {args['new_name']}.")
+    return _text(f"Saved exercise: {fields.get('name', args['name'])}.")
+
+
+@tool(
+    "gym_history",
+    "Recent sessions per exercise (weight×reps per set) and the double-progression "
+    "next step from the last session. Defaults to all active exercises.",
+    {
+        "type": "object",
+        "properties": {
+            "exercises": {"type": "array", "items": {"type": "string"}},
+            "sessions": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+        "required": [],
+    },
+)
+async def gym_history(args: dict[str, Any]) -> dict:
+    return _text(_gym.history_text(_conn, args.get("exercises"), int(args.get("sessions", 4))))
+
+
+@tool(
+    "plan_workout",
+    "Set the workout for one day: exercises in order with sets × reps @ weight. It "
+    "shows prefilled on Leo's gym page. Replaces any plan for that day. Weight is "
+    "the added weight (0 = bodyweight).",
+    {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "YYYY-MM-DD"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "exercise": {"type": "string"},
+                        "sets": {"type": "integer", "minimum": 1},
+                        "reps": {"type": "integer", "minimum": 1},
+                        "weight_kg": {"type": "number"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["exercise", "sets", "reps", "weight_kg"],
+                },
+            },
+        },
+        "required": ["date", "items"],
+    },
+)
+async def plan_workout(args: dict[str, Any]) -> dict:
+    try:
+        day = dt.date.fromisoformat(args["date"])
+    except ValueError:
+        return _text("Date must be YYYY-MM-DD.")
+    items, unknown = [], []
+    for it in args["items"]:
+        ex = _db.get_exercise(_conn, it["exercise"])
+        if ex is None:
+            unknown.append(it["exercise"])
+            continue
+        items.append({**it, "exercise_id": ex["id"]})
+    if unknown:
+        return _text(f"Unknown exercises: {', '.join(unknown)}. Add them with save_exercise first.")
+    _db.set_plan(_conn, day.isoformat(), items)
+    lines = [f"{it['exercise']}: {it['sets']}×{it['reps']} @ {it['weight_kg']:g} kg" for it in items]
+    return _text(f"Workout for {day:%a %d %b} is on the gym page:\n" + "\n".join(lines))
 
 
 # --- durable memory ----------------------------------------------------------
