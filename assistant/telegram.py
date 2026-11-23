@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 _URL = "https://api.telegram.org/bot{token}/{method}"
+LIMIT = 4096  # Telegram's cap on one message, in characters
 _FILE_URL = "https://api.telegram.org/file/bot{token}/{path}"
 
 
@@ -32,9 +33,9 @@ class Telegram:
     async def get_updates(self, offset: int | None, timeout: int = 60) -> list[dict]:
         return await self._call("getUpdates", offset=offset, timeout=timeout)
 
-    async def send_message(self, chat_id: int, text: str) -> dict:
-        # ponytail: Telegram caps text at 4096 chars; chunk when phase 1 needs it.
-        return await self._call("sendMessage", chat_id=chat_id, text=text[:4096])
+    async def send_message(self, chat_id: int, text: str) -> None:
+        for part in chunks(text):
+            await self._call("sendMessage", chat_id=chat_id, text=part)
 
     async def get_file(self, file_id: str) -> dict:
         """Resolve a file_id to its download path (valid ~1h). Bot API caps at 20 MB."""
@@ -46,3 +47,20 @@ class Telegram:
         )
         resp.raise_for_status()
         return resp.content
+
+
+def chunks(text: str, limit: int = LIMIT) -> list[str]:
+    """Split text into messages of at most `limit` chars, at a paragraph break,
+    else a line break, else a space, else hard. Nothing is dropped."""
+    out: list[str] = []
+    while len(text) > limit:
+        # The best break in the back half of the window; a hard cut if none.
+        cut = next(
+            (c for sep in ("\n\n", "\n", " ") if (c := text.rfind(sep, 0, limit)) > limit // 2),
+            limit,
+        )
+        out.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text or not out:
+        out.append(text)
+    return out

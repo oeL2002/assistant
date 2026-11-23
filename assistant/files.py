@@ -33,56 +33,11 @@ def save(files_dir: Path, name: str, data: bytes) -> Path:
     return dest
 
 
-# --- reading (confined to the drive) -----------------------------------------
-
-_TEXT_SUFFIXES = {
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
-    ".log", ".org", ".tex", ".bib", ".html", ".xml", ".ini", ".toml",
-}
-
-
-def _resolve(files_dir: Path, name: str) -> Path:
-    """Resolve `name` under the drive, refusing anything that escapes it."""
-    root = files_dir.resolve()
-    target = (root / name).resolve()
-    if not target.is_relative_to(root):
-        raise ValueError("outside the drive")
-    return target
+# --- listing ------------------------------------------------------------------
 
 
 def list_dir(files_dir: Path) -> list[str]:
-    root = files_dir
-    if not root.exists():
+    """Absolute paths, so the agent can hand them straight to its Read tool."""
+    if not files_dir.exists():
         return []
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
-
-
-def _pdf_text(path: Path) -> str:
-    from pypdf import PdfReader
-
-    reader = PdfReader(str(path))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
-
-
-def read_document(files_dir: Path, name: str, max_chars: int = 20000) -> str:
-    """Return a drive file's text. PDFs are text-extracted; unknown binaries are
-    reported, not dumped. Raises ValueError (escape) / FileNotFoundError."""
-    target = _resolve(files_dir, name)
-    if not target.is_file():
-        raise FileNotFoundError(name)
-    suffix = target.suffix.lower()
-    if suffix == ".pdf":
-        try:
-            text = _pdf_text(target)
-        except Exception as exc:  # noqa: BLE001 -- pypdf raises assorted types on bad PDFs
-            return f"(couldn't extract text from the PDF: {type(exc).__name__})"
-    elif suffix in _TEXT_SUFFIXES:
-        text = target.read_text(errors="replace")
-    else:
-        return f"({suffix or 'binary'} file, {target.stat().st_size} bytes — not readable as text)"
-    text = text.strip()
-    if not text:
-        return "(empty, or no extractable text — a scanned PDF would need OCR)"
-    if len(text) > max_chars:
-        return f"{text[:max_chars]}\n…(truncated; {len(text)} chars total)"
-    return text
+    return sorted(str(p.resolve()) for p in files_dir.rglob("*") if p.is_file() and ".stfolder" not in p.parts)

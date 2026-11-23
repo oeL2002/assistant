@@ -1,8 +1,5 @@
-"""SQLite state. One file, stdlib only, no ORM.
-
-Phase 0 needs the message log; `tasks` is here already so phase 1 (calendar +
-task coaching) has a place to write without a migration. Add columns as needed —
-this is personal, single-writer, and small forever.
+"""SQLite state. One file, stdlib only, no ORM. Add columns as needed (see
+_ADDED_COLUMNS) — this is personal, single-writer, and small forever.
 """
 
 from __future__ import annotations
@@ -84,6 +81,42 @@ CREATE TABLE IF NOT EXISTS sent_invites (
     sequence INTEGER NOT NULL DEFAULT 0,
     status   TEXT NOT NULL DEFAULT 'sent'   -- sent | cancelled
 );
+
+-- One occurrence of a recurring series changed on its own: moved/renamed, or
+-- cancelled. `occurrence` is that occurrence's ORIGINAL start (ISO with offset),
+-- which is what iCalendar's RECURRENCE-ID / EXDATE name it by. `kind` says which
+-- series table event_id points into.
+CREATE TABLE IF NOT EXISTS overrides (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT NOT NULL,                -- plan | invite
+    event_id   INTEGER NOT NULL,
+    occurrence TEXT NOT NULL,
+    start_at   TEXT,                         -- NULL when cancelled
+    end_at     TEXT,
+    summary    TEXT,                         -- NULL = keep the series' summary
+    cancelled  INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (kind, event_id, occurrence)
+);
+
+-- Things to bring up when Leo next talks about a topic, not at a time. Pending
+-- ones are listed in the system prompt; the agent clears one once acted on.
+CREATE TABLE IF NOT EXISTS topic_triggers (
+    id      INTEGER PRIMARY KEY,
+    created TEXT NOT NULL DEFAULT (datetime('now')),
+    topic   TEXT NOT NULL,
+    prompt  TEXT NOT NULL,
+    done    INTEGER NOT NULL DEFAULT 0
+);
+
+-- What Leo actually did (sleep, study, gym, ...), for plan-vs-actual and stats.
+CREATE TABLE IF NOT EXISTS activity_log (
+    id       INTEGER PRIMARY KEY,
+    created  TEXT NOT NULL DEFAULT (datetime('now')),
+    kind     TEXT NOT NULL,          -- lower-case: sleep, study, work, gym, ...
+    start_at TEXT NOT NULL,          -- ISO 8601 with offset
+    end_at   TEXT NOT NULL,
+    note     TEXT
+);
 """
 
 
@@ -95,6 +128,10 @@ CREATE TABLE IF NOT EXISTS sent_invites (
 _ADDED_COLUMNS = [
     ("sent_invites", "show_as", "TEXT NOT NULL DEFAULT 'busy'"),
     ("sent_invites", "rrule", "TEXT"),
+    ("plan_events", "rrule", "TEXT"),
+    # Fire only if Leo hasn't written since the reminder was set (a nudge that
+    # is moot once he's replied, e.g. a wake-up check).
+    ("reminders", "only_if_silent", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -199,14 +236,39 @@ def update_task(conn: sqlite3.Connection, task_id: int, fields: dict) -> bool:
 
 
 def add_event(
-    conn: sqlite3.Connection, summary: str, start_at: str, end_at: str, notes: str | None = None
+    conn: sqlite3.Connection,
+    summary: str,
+    start_at: str,
+    end_at: str,
+    notes: str | None = None,
+    rrule: str | None = None,
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO plan_events (summary, start_at, end_at, notes) VALUES (?, ?, ?, ?)",
-        (summary, start_at, end_at, notes),
+        "INSERT INTO plan_events (summary, start_at, end_at, notes, rrule) VALUES (?, ?, ?, ?, ?)",
+        (summary, start_at, end_at, notes, rrule),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def get_event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM plan_events WHERE id = ?", (event_id,)).fetchone()
+
+
+_EVENT_FIELDS = {"summary", "start_at", "end_at", "notes", "rrule"}
+
+
+def update_event(conn: sqlite3.Connection, event_id: int, fields: dict) -> bool:
+    """Edit a block (or a whole series) in place; the id stays the same."""
+    fields = {k: v for k, v in fields.items() if k in _EVENT_FIELDS}
+    if not fields:
+        return False
+    assignments = ", ".join(f"{k} = ?" for k in fields)
+    cur = conn.execute(
+        f"UPDATE plan_events SET {assignments} WHERE id = ?", (*fields.values(), event_id)
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def list_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -216,8 +278,41 @@ def list_events(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def delete_event(conn: sqlite3.Connection, event_id: int) -> bool:
     cur = conn.execute("DELETE FROM plan_events WHERE id = ?", (event_id,))
+    conn.execute("DELETE FROM overrides WHERE kind = 'plan' AND event_id = ?", (event_id,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# --- per-occurrence overrides of recurring series ----------------------------
+
+
+def set_override(
+    conn: sqlite3.Connection,
+    kind: str,
+    event_id: int,
+    occurrence: str,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    summary: str | None = None,
+    cancelled: bool = False,
+) -> None:
+    """Move/rename or cancel one occurrence. A later call for the same occurrence
+    replaces the earlier one (move it twice and only the last move counts)."""
+    conn.execute(
+        "INSERT INTO overrides (kind, event_id, occurrence, start_at, end_at, summary, cancelled) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, event_id, occurrence) DO UPDATE SET "
+        "start_at = excluded.start_at, end_at = excluded.end_at, summary = excluded.summary, "
+        "cancelled = excluded.cancelled",
+        (kind, event_id, occurrence, start_at, end_at, summary, int(cancelled)),
+    )
+    conn.commit()
+
+
+def list_overrides(conn: sqlite3.Connection, kind: str, event_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM overrides WHERE kind = ? AND event_id = ? ORDER BY occurrence",
+        (kind, event_id),
+    ).fetchall()
 
 
 # --- memories (durable facts, injected into the system prompt) ---------------
@@ -242,10 +337,12 @@ def delete_memory(conn: sqlite3.Connection, mem_id: int) -> bool:
 # --- reminders (self-set triggers) -------------------------------------------
 
 
-def add_reminder(conn: sqlite3.Connection, fire_at: str, prompt: str, chat_id: int) -> int:
+def add_reminder(
+    conn: sqlite3.Connection, fire_at: str, prompt: str, chat_id: int, only_if_silent: bool = False
+) -> int:
     cur = conn.execute(
-        "INSERT INTO reminders (fire_at, prompt, chat_id) VALUES (?, ?, ?)",
-        (fire_at, prompt, chat_id),
+        "INSERT INTO reminders (fire_at, prompt, chat_id, only_if_silent) VALUES (?, ?, ?, ?)",
+        (fire_at, prompt, chat_id, int(only_if_silent)),
     )
     conn.commit()
     return cur.lastrowid
@@ -328,5 +425,58 @@ def cancel_sent_invite(conn: sqlite3.Connection, invite_id: int) -> bool:
         "WHERE id = ? AND status = 'sent'",
         (invite_id,),
     )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def leo_wrote_since(conn: sqlite3.Connection, since: str) -> bool:
+    """Has Leo sent a message after `since` (a sqlite datetime('now') string)?"""
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE role = 'user' AND ts > ? LIMIT 1", (since,)
+    ).fetchone()
+    return row is not None
+
+
+# --- topic triggers ----------------------------------------------------------
+
+
+def add_topic_trigger(conn: sqlite3.Connection, topic: str, prompt: str) -> int:
+    cur = conn.execute("INSERT INTO topic_triggers (topic, prompt) VALUES (?, ?)", (topic, prompt))
+    conn.commit()
+    return cur.lastrowid
+
+
+def pending_topic_triggers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM topic_triggers WHERE done = 0 ORDER BY id").fetchall()
+
+
+def clear_topic_trigger(conn: sqlite3.Connection, tid: int) -> bool:
+    cur = conn.execute("UPDATE topic_triggers SET done = 1 WHERE id = ? AND done = 0", (tid,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# --- activity log ------------------------------------------------------------
+
+
+def add_activity(
+    conn: sqlite3.Connection, kind: str, start_at: str, end_at: str, note: str | None = None
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO activity_log (kind, start_at, end_at, note) VALUES (?, ?, ?, ?)",
+        (kind.strip().lower(), start_at, end_at, note),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_activity(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All entries, earliest first; callers window them (ISO strings with mixed
+    offsets don't compare correctly in SQL)."""
+    return conn.execute("SELECT * FROM activity_log ORDER BY start_at, id").fetchall()
+
+
+def delete_activity(conn: sqlite3.Connection, aid: int) -> bool:
+    cur = conn.execute("DELETE FROM activity_log WHERE id = ?", (aid,))
     conn.commit()
     return cur.rowcount > 0

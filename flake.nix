@@ -31,7 +31,6 @@
           claude-agent-sdk
           icalendar
           recurring-ical-events
-          pypdf
         ];
         # Tests are stdlib-only (sqlite, env); the brain's `claude` CLI is not
         # needed to build or to run these.
@@ -50,7 +49,6 @@
               claude-agent-sdk
               icalendar
               recurring-ical-events
-              pypdf
               pytest
             ]))
           pkgs.ruff

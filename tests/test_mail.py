@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import icalendar
 
-from assistant.mail import build_invite, parse_message
+from assistant.mail import build_invite, parse_message, read_full
 
 TZ = ZoneInfo("Europe/Zurich")
 
@@ -84,3 +84,116 @@ def test_parse_message_decodes_headers_and_body():
     assert m["from"] == "Boss <boss@example.com>"
     assert m["subject"] == "Grüezi"
     assert "Accepted: thesis block." in m["snippet"]
+
+
+def _pdf(text: str) -> bytes:
+    """A minimal valid one-page PDF whose page draws `text`."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        ),
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out, offsets = b"%PDF-1.4\n", []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return out
+
+
+def _forward_with_pdf() -> bytes:
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = "Leo <leo@example.com>"
+    msg["Subject"] = "Fwd: Programm"
+    msg.set_content("---------- Forwarded message ----------\nFrom: Club\nSee the programme.")
+    msg.add_attachment(_pdf("Meeting on 4 December"), maintype="application",
+                       subtype="pdf", filename="programm.pdf")
+    return msg.as_bytes()
+
+
+def test_parse_message_lists_attachments():
+    m = parse_message(_forward_with_pdf())
+    assert m["attachments"] == ["programm.pdf"]
+    assert "See the programme." in m["snippet"]
+
+
+def test_read_full_saves_attachments_for_native_reading(tmp_path):
+    out = read_full(_forward_with_pdf(), tmp_path / "mail" / "7")
+    assert "Subject: Fwd: Programm" in out
+    assert "See the programme." in out  # inline forward body
+    saved = tmp_path / "mail" / "7" / "programm.pdf"
+    assert f"[attachment saved: {saved.resolve()} (application/pdf" in out
+    assert saved.read_bytes().startswith(b"%PDF")
+    read_full(_forward_with_pdf(), tmp_path / "mail" / "7")  # read again: no programm-1.pdf
+    assert [p.name for p in saved.parent.iterdir()] == ["programm.pdf"]
+
+
+def test_read_full_without_drive_only_names_attachments():
+    assert "[attachment programm.pdf," in read_full(_forward_with_pdf())
+
+
+def test_attachment_name_cannot_escape(tmp_path):
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = "x"
+    msg.set_content("x")
+    msg.add_attachment(b"x", maintype="text", subtype="plain", filename="../../evil.txt")
+    read_full(msg.as_bytes(), tmp_path / "d")
+    assert (tmp_path / "d" / "evil.txt").exists()
+    assert not (tmp_path / "evil.txt").exists()
+
+
+def test_read_full_renders_forward_as_attachment():
+    from email.message import EmailMessage
+
+    inner = EmailMessage()
+    inner["From"] = "HR <hr@example.com>"
+    inner["Subject"] = "Hotel booking"
+    inner.set_content("Room booked for 20-24 May.")
+    outer = EmailMessage()
+    outer["From"] = "Leo <leo@example.com>"
+    outer["Subject"] = "FW: Hotel booking"
+    outer.set_content("fyi")
+    outer.add_attachment(inner)  # message/rfc822, Outlook's "forward as attachment"
+
+    out = read_full(outer.as_bytes())
+    assert "[attached message]" in out
+    assert "Subject: Hotel booking" in out
+    assert "Room booked for 20-24 May." in out
+
+
+def test_html_only_body_becomes_text():
+    raw = (
+        b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        b"<html><style>p{color:red}</style><p>Hello</p><p>World</p></html>"
+    )
+    out = read_full(raw)
+    assert "Hello" in out and "World" in out
+    assert "<p>" not in out and "color:red" not in out
+
+
+def test_build_invite_single_occurrence_has_recurrence_id_and_no_rrule():
+    occ = dt.datetime(2026, 11, 25, 8, tzinfo=TZ)
+    cal = icalendar.Calendar.from_ical(
+        build_invite(
+            "Im Büro", occ, occ + dt.timedelta(hours=9), "a@example.com", "l@example.com",
+            "u@example.com", sequence=3, method="CANCEL", rrule="FREQ=WEEKLY", recurrence_id=occ,
+        )
+    )
+    ev = cal.walk("VEVENT")[0]
+    assert ev["uid"] == "u@example.com"  # same series
+    assert ev["recurrence-id"].dt == occ  # ...this one occurrence
+    assert "rrule" not in ev
+    assert cal["method"] == "CANCEL"

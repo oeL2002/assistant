@@ -1,7 +1,7 @@
 # assistant
 
 Leo's personal assistant. Telegram front end over the Claude Agent SDK, with
-SQLite state. Deployed to the T430 by the NixOS module in the `Nixconfig` repo,
+SQLite state. Deployed to EliteDesk1 by the NixOS module in the `Nixconfig` repo,
 which consumes this flake as an input.
 
 Design and rationale live in `~/reports/assistant-scope.md`.
@@ -36,8 +36,8 @@ service hands them in via `LoadCredential` without putting them in the env dump.
 
 ## Deploy
 
-Via `Nixconfig`: `modules/services/assistant.nix` runs
+Via `Nixconfig`: `modules/programms/assistant/assistant.nix` runs
 `inputs.assistant.packages.<system>.default`. Bump with
-`nix flake update assistant` in Nixconfig, then `deploy .#T430`. For tight
+`nix flake update assistant` in Nixconfig, then `deploy .#EliteDesk1`. For tight
 iteration, point the input at this working tree:
-`deploy .#T430 --override-input assistant path:$HOME/Repos/assistant`.
+`deploy .#EliteDesk1 --override-input assistant path:$HOME/Repos/assistant`.

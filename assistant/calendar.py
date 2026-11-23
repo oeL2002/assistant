@@ -23,6 +23,10 @@ class Event:
     end: dt.datetime
     summary: str
     location: str
+    uid: str = ""
+    # Original start of a recurring occurrence (RECURRENCE-ID), None for a
+    # one-off. Differs from `start` when that one occurrence was moved.
+    occurrence: dt.datetime | None = None
 
 
 def parse_local(s: str) -> dt.datetime:
@@ -53,7 +57,17 @@ def expand(raw: bytes, start: dt.datetime, end: dt.datetime) -> list[Event]:
         s = _as_dt(e["DTSTART"].dt)
         end_prop = e.get("DTEND")
         en = _as_dt(end_prop.dt) if end_prop is not None else s
-        events.append(Event(s, en, str(e.get("SUMMARY", "")), str(e.get("LOCATION", ""))))
+        rid = e.get("RECURRENCE-ID")
+        events.append(
+            Event(
+                s,
+                en,
+                str(e.get("SUMMARY", "")),
+                str(e.get("LOCATION", "")),
+                str(e.get("UID", "")),
+                _as_dt(rid.dt) if rid is not None else None,
+            )
+        )
     events.sort(key=lambda ev: ev.start)
     return events
 

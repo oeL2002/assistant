@@ -3,6 +3,7 @@
   assistant            -> the always-on daemon: long-poll Telegram, answer, persist,
                           and publish the plan calendar over the tailnet.
   assistant briefing   -> one-shot: send Leo a morning briefing (run by a timer).
+  assistant weekly     -> one-shot: Sunday check of next week's work calendar and plan.
 """
 
 from __future__ import annotations
@@ -15,24 +16,53 @@ import sys
 import httpx
 
 from . import files, publish, tools
-from .brain import reply
+from .brain import TZ, reply
 from .calendar import Calendar
 from .config import Config
 from .db import (
     connect,
+    get_meta,
+    leo_wrote_since,
     log_message,
     mark_reminder_done,
     pending_reminders,
+    set_meta,
 )
 from .telegram import Telegram
 
+# Prompts the timers fire into the brain, by subcommand name. The NixOS module
+# has one timer per name.
+JOBS = {
+    "briefing": (
+        "Give me a brief morning briefing: today's schedule and the 1-3 tasks to focus "
+        "on. If I have an early commitment today, also set one or two `only_if_silent` "
+        "reminders shortly before I need to leave or start, to check I'm up."
+    ),
+    "weekly": (
+        "[weekly check, Sunday evening] Look at the coming week. 1) Work calendar: are "
+        "my office and away days for next week on it (list_work_invites, "
+        "upcoming_events)? Fix gaps and changes, using per-occurrence changes on the "
+        "standing series. If you don't know a day, ask me one short question. 2) Plan: "
+        "do deadlines and open tasks for the week have realistic blocks? Add or move "
+        "them. 3) One or two lines on last week: activity_stats against the plan. "
+        "Keep the message short."
+    ),
+}
 
-async def _receive_file(tg: Telegram, cfg: Config, doc: dict) -> str:
-    name = doc.get("file_name") or f"{doc['file_id']}.bin"
-    info = await tg.get_file(doc["file_id"])
+_HEARTBEAT_KEY = "heartbeat"
+_OUTAGE = dt.timedelta(minutes=10)  # a gap in heartbeats longer than this was an outage
+_STALE = dt.timedelta(hours=2)  # a reminder this late gets flagged as possibly moot
+_SETTLE_S = 1.5  # wait this long for the rest of a message Telegram split up
+
+
+def _local(utc_iso: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(utc_iso).astimezone(TZ)
+
+
+async def _save_upload(tg: Telegram, cfg: Config, file_id: str, name: str) -> str:
+    info = await tg.get_file(file_id)
     data = await tg.download_file(info["file_path"])
-    dest = files.save(cfg.files_dir, name, data)
-    return f"Saved {dest.name} to your drive ({max(1, len(data) // 1024)} KB)."
+    return str(files.save(cfg.files_dir, name, data).resolve())
 
 
 async def _fire_due_reminders(tg: Telegram, conn: sqlite3.Connection) -> None:
@@ -40,15 +70,94 @@ async def _fire_due_reminders(tg: Telegram, conn: sqlite3.Connection) -> None:
     before firing so a crash can't turn it into a resend loop."""
     now = dt.datetime.now(dt.UTC)
     for r in pending_reminders(conn):
-        if dt.datetime.fromisoformat(r["fire_at"]) > now:
+        due = dt.datetime.fromisoformat(r["fire_at"])
+        if due > now:
             break  # ordered by fire_at: the first future one ends the scan
         mark_reminder_done(conn, r["id"])
+        if r["only_if_silent"] and leo_wrote_since(conn, r["created"]):
+            continue  # he has written since: the nudge is moot
+        prompt = f"[scheduled reminder you set earlier] {r['prompt']}"
+        if now - due > _STALE:
+            prompt = (
+                f"[scheduled reminder you set earlier, due {due.astimezone(TZ):%a %d %b %H:%M} "
+                f"but delivered {(now - due).total_seconds() / 3600:.0f} h late because you "
+                f"were offline — it may be moot; only bring it up if it still matters] "
+                f"{r['prompt']}"
+            )
         try:
-            answer = await reply(f"[scheduled reminder you set earlier] {r['prompt']}", conn)
+            answer = await reply(prompt, conn)
         except Exception as exc:  # keep the daemon alive on any brain error
             answer = f"(reminder error: {type(exc).__name__})"
         log_message(conn, r["chat_id"], "assistant", answer)
         await tg.send_message(r["chat_id"], answer)
+
+
+async def _report_outage(tg: Telegram, conn: sqlite3.Connection, cfg: Config) -> None:
+    """On start: if the last heartbeat is old, tell Leo how long the bot was down,
+    so a silence is never mistaken for 'nothing to say'."""
+    last = get_meta(conn, _HEARTBEAT_KEY)
+    now = dt.datetime.now(dt.UTC)
+    if last is None or cfg.allowed_chat_id is None:
+        return
+    gap = now - dt.datetime.fromisoformat(last)
+    if gap > _OUTAGE:
+        await tg.send_message(
+            cfg.allowed_chat_id,
+            f"I was offline from {_local(last):%a %d %b %H:%M} to {now.astimezone(TZ):%a %H:%M} "
+            f"({gap.total_seconds() / 3600:.1f} h). Messages you sent then may be lost; "
+            "missed reminders follow.",
+        )
+
+
+async def _collect(tg: Telegram, offset: int | None) -> tuple[list[dict], int | None]:
+    """One long-poll, then keep taking updates while they still arrive: Telegram
+    splits a long message into several, sent a moment apart, and they must reach
+    the brain as one."""
+    updates = await tg.get_updates(offset)
+    while updates:
+        offset = updates[-1]["update_id"] + 1
+        await asyncio.sleep(_SETTLE_S)
+        more = await tg.get_updates(offset, timeout=0)
+        if not more:
+            break
+        updates += more
+    return updates, offset
+
+
+async def _handle(tg: Telegram, cfg: Config, conn: sqlite3.Connection, msgs: list[dict]) -> None:
+    """One turn for everything Leo sent in one burst: texts joined, files saved
+    to the drive and named in the prompt so the brain can Read them."""
+    chat_id = msgs[0]["chat"]["id"]
+    texts: list[str] = []
+    saved: list[str] = []
+    for msg in msgs:
+        try:
+            if doc := msg.get("document"):
+                name = doc.get("file_name") or f"{doc['file_id']}.bin"
+                saved.append(await _save_upload(tg, cfg, doc["file_id"], name))
+            elif photo := msg.get("photo"):
+                name = f"photo-{dt.datetime.now(TZ):%Y%m%d-%H%M%S}.jpg"
+                saved.append(await _save_upload(tg, cfg, photo[-1]["file_id"], name))  # largest
+        except (httpx.HTTPError, RuntimeError, OSError, KeyError) as exc:
+            texts.append(f"[a file I sent couldn't be saved: {type(exc).__name__}]")
+        if t := msg.get("text") or msg.get("caption"):
+            texts.append(t)
+    if not texts and not saved:
+        return  # voice, stickers: not handled yet
+    if not texts:  # files without a word: just file them
+        log_message(conn, chat_id, "user", "[files: " + ", ".join(saved) + "]")
+        answer = "Saved to your drive: " + ", ".join(p.rsplit("/", 1)[-1] for p in saved)
+    else:
+        prompt = "\n\n".join(texts)
+        if saved:
+            prompt += "\n\n[I sent files, saved to the drive: " + ", ".join(saved) + "]"
+        log_message(conn, chat_id, "user", prompt)
+        try:
+            answer = await reply(prompt, conn)
+        except Exception as exc:  # keep the loop alive on any brain error
+            answer = f"(error: {type(exc).__name__})"
+    log_message(conn, chat_id, "assistant", answer)
+    await tg.send_message(chat_id, answer)
 
 
 async def run() -> None:
@@ -58,43 +167,36 @@ async def run() -> None:
     async with httpx.AsyncClient() as client:
         tools.init(conn, Calendar(cfg.calendar_ics_url, client), cfg)
         tg = Telegram(cfg.telegram_token, client)
+        try:
+            await _report_outage(tg, conn, cfg)
+        except (httpx.HTTPError, RuntimeError):
+            pass  # no network yet; the gap is still visible in the reminders
         offset: int | None = None
         while True:
+            set_meta(conn, _HEARTBEAT_KEY, dt.datetime.now(dt.UTC).isoformat())
             try:
-                updates = await tg.get_updates(offset)
+                updates, offset = await _collect(tg, offset)
             except (httpx.HTTPError, RuntimeError):
                 await asyncio.sleep(5)
                 continue
             await _fire_due_reminders(tg, conn)  # due within ~1 poll (≤60s)
-            for update in updates:
-                offset = update["update_id"] + 1
-                msg = update.get("message") or {}
-                chat_id = (msg.get("chat") or {}).get("id")
-                if chat_id is None:
-                    continue
-                if cfg.allowed_chat_id is not None and chat_id != cfg.allowed_chat_id:
-                    continue  # ignore everyone but Leo
-                text = msg.get("text")
-                doc = msg.get("document")
-                if text:
-                    log_message(conn, chat_id, "user", text)
-                    try:
-                        answer = await reply(text, conn)
-                    except Exception as exc:  # keep the loop alive on any brain error
-                        answer = f"(error: {type(exc).__name__})"
-                elif doc:
-                    log_message(conn, chat_id, "user", f"[file: {doc.get('file_name', '?')}]")
-                    try:
-                        answer = await _receive_file(tg, cfg, doc)
-                    except (httpx.HTTPError, RuntimeError, OSError, KeyError) as exc:
-                        answer = f"(couldn't save that file: {type(exc).__name__})"
-                else:
-                    continue  # voice, photos, stickers: not handled yet
-                log_message(conn, chat_id, "assistant", answer)
-                await tg.send_message(chat_id, answer)
+            mine = [
+                u["message"]
+                for u in updates
+                if (u.get("message") or {}).get("chat", {}).get("id") is not None
+                and (
+                    cfg.allowed_chat_id is None
+                    or u["message"]["chat"]["id"] == cfg.allowed_chat_id
+                )  # ignore everyone but Leo
+            ]
+            by_chat: dict[int, list[dict]] = {}
+            for m in mine:
+                by_chat.setdefault(m["chat"]["id"], []).append(m)
+            for msgs in by_chat.values():
+                await _handle(tg, cfg, conn, msgs)
 
 
-async def briefing() -> None:
+async def run_job(name: str) -> None:
     cfg = Config.from_env()
     if cfg.allowed_chat_id is None:
         return  # nowhere to send it
@@ -102,22 +204,21 @@ async def briefing() -> None:
     async with httpx.AsyncClient() as client:
         tools.init(conn, Calendar(cfg.calendar_ics_url, client), cfg)
         tg = Telegram(cfg.telegram_token, client)
-        prompt = "Give me a brief morning briefing: today's schedule and the 1-3 tasks to focus on."
+        prompt = JOBS[name]
         log_message(conn, cfg.allowed_chat_id, "user", prompt)
-        # ponytail: shares the chat session for continuity; a collision with an
-        # in-flight daemon reply is possible but ~seconds/day. Separate session
-        # key if that ever bites.
         try:
-            answer = await reply(prompt, conn)
+            answer = await reply(prompt, conn)  # the brain lock queues it behind a live turn
         except Exception as exc:
-            answer = f"(briefing error: {type(exc).__name__})"
+            answer = f"({name} error: {type(exc).__name__})"
         log_message(conn, cfg.allowed_chat_id, "assistant", answer)
         await tg.send_message(cfg.allowed_chat_id, answer)
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "briefing":
-        asyncio.run(briefing())
+    if len(sys.argv) > 1:
+        if sys.argv[1] not in JOBS:
+            raise SystemExit(f"unknown job {sys.argv[1]!r}; known: {', '.join(JOBS)}")
+        asyncio.run(run_job(sys.argv[1]))
     else:
         asyncio.run(run())
 

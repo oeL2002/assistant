@@ -22,21 +22,65 @@ from .calendar import parse_local
 PLAN_ICS_PORT = 8737  # must match the firewall line in the NixOS assistant module
 
 
-def render_plan_ics(rows: list[sqlite3.Row]) -> bytes:
+def plan_uid(event_id: int) -> str:
+    return f"plan-{event_id}@assistant.invalid"
+
+
+def plan_id(uid: str) -> int | None:
+    """Inverse of plan_uid; None for anything else."""
+    if uid.startswith("plan-") and uid.endswith("@assistant.invalid"):
+        return int(uid[5 : -len("@assistant.invalid")])
+    return None
+
+
+def render_plan_ics(
+    rows: list[sqlite3.Row], overrides: dict[int, list[sqlite3.Row]] | None = None
+) -> bytes:
+    """Rows (+ per-occurrence overrides of recurring rows) -> ICS. A recurring
+    block is one VEVENT with an RRULE; a cancelled occurrence is an EXDATE on it;
+    a moved/renamed one is a second VEVENT with the same UID and a RECURRENCE-ID
+    naming the occurrence it replaces. That is the standard shape, so phones and
+    recurring_ical_events both read it."""
+    overrides = overrides or {}
     cal = icalendar.Calendar()
     cal.add("prodid", "-//Leo's assistant//plan//EN")
     cal.add("version", "2.0")
     cal.add("x-wr-calname", "Assistant plan")
     for r in rows:
         ev = icalendar.Event()
-        ev.add("uid", f"plan-{r['id']}@assistant.invalid")
+        ev.add("uid", plan_uid(r["id"]))
         ev.add("summary", r["summary"])
         ev.add("dtstart", parse_local(r["start_at"]))
         ev.add("dtend", parse_local(r["end_at"]))
         if r["notes"]:
             ev.add("description", r["notes"])
+        if r["rrule"]:
+            ev.add("rrule", icalendar.vRecur.from_ical(r["rrule"]))
+        own = overrides.get(r["id"], []) if r["rrule"] else []
+        exdates = [parse_local(o["occurrence"]) for o in own if o["cancelled"]]
+        if exdates:
+            ev.add("exdate", exdates)
         cal.add_component(ev)
+        for o in own:
+            if o["cancelled"]:
+                continue
+            moved = icalendar.Event()
+            moved.add("uid", plan_uid(r["id"]))
+            moved.add("recurrence-id", parse_local(o["occurrence"]))
+            moved.add("summary", o["summary"] or r["summary"])
+            moved.add("dtstart", parse_local(o["start_at"]))
+            moved.add("dtend", parse_local(o["end_at"]))
+            if r["notes"]:
+                moved.add("description", r["notes"])
+            cal.add_component(moved)
     return cal.to_ical()
+
+
+def plan_ics(conn: sqlite3.Connection) -> bytes:
+    """The whole plan layer as ICS, overrides applied."""
+    rows = db.list_events(conn)
+    overrides = {r["id"]: db.list_overrides(conn, "plan", r["id"]) for r in rows if r["rrule"]}
+    return render_plan_ics(rows, overrides)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -49,7 +93,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
-            body = render_plan_ics(db.list_events(conn))
+            body = plan_ics(conn)
         finally:
             conn.close()
         self.send_response(200)
